@@ -31,33 +31,58 @@ String boneName[][2] = {
 };
 
 
-// Choose only one!
-// NOTE: `bone` is kept only for the on-screen label and the legacy "reboot"
-// receive path. It is NO LONGER sent over ESP-NOW -- the wire format is now
-// the fixed-size binary packet defined below. The host derives bone-name
-// from `sendID` via the same table used in custom_icm.js / Dongle.ino.
-// String bone = "Head"; int sendID = 0;  uint16_t BG = 0xffff; uint16_t FG = 0x0000;
- String bone = "Spine"; int sendID = 1;  uint16_t BG = 0xffff; uint16_t FG = 0x0000;
-// String bone = "HipsAlt"; int sendID = 2;  uint16_t BG = 0xffff; uint16_t FG = 0x0000;
-// String bone = "LeftArm"; int sendID = 3; uint16_t BG = 0x62d6; uint16_t FG = 0xffff;
-// String bone = "LeftForeArm"; int sendID = 4; uint16_t BG = 0x62d6; uint16_t FG = 0xffff;
-// String bone = "LeftHand"; int sendID = 5;  uint16_t BG = 0x62d6; uint16_t FG = 0xffff;
-// String bone = "RightArm"; int sendID = 6; uint16_t BG = 0xf720; uint16_t FG = 0x0000;
-// String bone = "RightForeArm"; int sendID = 7;  uint16_t BG = 0xf720; uint16_t FG = 0x0000;
-// String bone = "RightHand"; int sendID = 8;  uint16_t BG = 0xf720; uint16_t FG = 0x0000;
-// String bone = "LeftUpLeg"; int sendID = 9;  uint16_t BG = 0xc086; uint16_t FG = 0xffff;
-// String bone = "LeftLeg"; int sendID = 10; uint16_t BG = 0xc086; uint16_t FG =  0xffff;
-// String bone = "LeftFoot"; int sendID = 11; uint16_t BG = 0xc086; uint16_t FG =  0xffff;
-// String bone = "RightUpLeg"; int sendID = 12; uint16_t BG = 0x3d89; uint16_t FG =  0xffff;
-// String bone = "RightLeg"; int sendID = 13; uint16_t BG = 0x3d89; uint16_t FG = 0xffff;
-// String bone = "RightFoot"; int sendID = 14; uint16_t BG = 0x3d89; uint16_t FG =  0xffff;
-// String bone = "LeftShoulder"; int sendID = 15; uint16_t BG = 0x62d6; uint16_t FG = 0xffff;
-// String bone = "RightShoulder"; int sendID = 16; uint16_t BG = 0xf720; uint16_t FG = 0x0000;
+// =========================================================================
+//  POD IDENTITY  --  Phase 2, addresses NODE-05 (promoted to BLOCKER in §4.2)
+//
+//  The bone id is now supplied by the BUILD, not by editing comments here.
+//  Phase 1 found the id was chosen by uncommenting one of 17 mutually
+//  exclusive lines; flashing a 17-device fleet three times that way will
+//  eventually produce a duplicate sendID, which is SILENT at runtime and
+//  presents as "a node didn't connect".
+//
+//  Build one image per pod:
+//      arduino-cli compile \
+//        --build-property "build.extra_flags=-DMESQ_POD_ID=3" ...
+//  or run  tools/build_pods.sh  which generates all 17.
+//
+//  If MESQ_POD_ID is not defined the build FAILS. That is deliberate: a
+//  build error is recoverable in seconds, a duplicate id costs a session.
+// =========================================================================
+#ifndef MESQ_POD_ID
+#error "MESQ_POD_ID is not defined. Build with -DMESQ_POD_ID=<0..16> (see tools/build_pods.sh). Phase 2 removed the comment-toggle identity block; see system_assessment_2/ROLLOUT.md"
+#endif
+#if (MESQ_POD_ID < 0) || (MESQ_POD_ID > 16)
+#error "MESQ_POD_ID out of range - valid bone ids are 0..16 (see boneName[] above)"
+#endif
+
+// Screen colours per bone id, transcribed verbatim from the Phase 1
+// comment block so the on-watch appearance is unchanged.
+static const uint16_t POD_BG[17] = {
+  0xffff, 0xffff, 0xffff,          //  0 Head, 1 Spine, 2 HipsAlt
+  0x62d6, 0x62d6, 0x62d6,          //  3-5   left arm chain
+  0xf720, 0xf720, 0xf720,          //  6-8   right arm chain
+  0xc086, 0xc086, 0xc086,          //  9-11  left leg chain
+  0x3d89, 0x3d89, 0x3d89,          // 12-14  right leg chain
+  0x62d6, 0xf720                   // 15 LeftShoulder, 16 RightShoulder
+};
+static const uint16_t POD_FG[17] = {
+  0x0000, 0x0000, 0x0000,
+  0xffff, 0xffff, 0xffff,
+  0x0000, 0x0000, 0x0000,
+  0xffff, 0xffff, 0xffff,
+  0xffff, 0xffff, 0xffff,
+  0xffff, 0x0000
+};
+
+const int sendID = MESQ_POD_ID;
+uint16_t BG = POD_BG[MESQ_POD_ID];
+uint16_t FG = POD_FG[MESQ_POD_ID];
 
 
 
 
 #include <esp_now.h>
+#include <esp_system.h>  // Phase 2 W0: esp_reset_reason(), esp_get_idf_version()
 #include <esp_wifi.h>   // Needed for esp_wifi_set_channel / esp_wifi_set_ps /
                         // esp_wifi_set_max_tx_power. Without these the radio
                         // floats to whatever channel the environment pushes
@@ -85,6 +110,49 @@ String boneName[][2] = {
 //  6 or 11 -- the value just has to match the dongle.
 // ===========================================================================
 #define ESPNOW_WIFI_CHANNEL 1
+
+// =========================================================================
+//  PHASE 2 INSTRUMENTATION  (W1)  -- observational only, no behaviour change
+//  Build with -DMESQ_INSTR=1 to enable. With it 0 (default) every hook
+//  compiles to nothing and the image is behaviourally identical to Phase 1.
+//
+//  I9  read duration + Quat6/s   -> SENS-01 (~55 Hz DMP ceiling), SENS-02
+//  I4  send-interval histogram   -> NODE-03 (tick quantisation, S2)
+//  I8  reset reason + boot count -> NODE-04 (init hang, S3/S4)
+//  I11 free heap                 -> fragmentation
+//  N1  unit-norm violations      -> NODE-01 (torn cross-core quaternion)
+//  N2  negative sqrt radicand    -> SENS-03 (NaN -> zero quaternion)
+//  N3  sample-to-send age        -> NODE-02 / SYNC-02 (stamp at transmit)
+// =========================================================================
+#ifndef MESQ_INSTR
+#define MESQ_INSTR 0
+#endif
+
+#if MESQ_INSTR
+#include <esp_timer.h>
+RTC_DATA_ATTR uint32_t mesq_bootCount = 0;   // survives reset, not power loss
+
+// I9
+static volatile uint32_t mesq_readN = 0, mesq_readMin = 0xFFFFFFFF,
+                         mesq_readMax = 0; static volatile uint64_t mesq_readSum = 0;
+static volatile uint32_t mesq_quat6N = 0;    // Quat6 FIFO packets this second
+static volatile uint32_t mesq_fifoMoreN = 0; // reads reporting FIFOMoreDataAvail
+// I4  - send intervals bucketed in ms: <20,20-29,30-39,40-49,50-59,60+
+static volatile uint32_t mesq_sendBuckets[6] = {0,0,0,0,0,0};
+static volatile uint32_t mesq_sendN = 0, mesq_sendMin = 0xFFFFFFFF, mesq_sendMax = 0;
+// N1/N2/N3
+static volatile uint32_t mesq_normBad = 0, mesq_radNeg = 0;
+static volatile uint32_t mesq_ageN = 0, mesq_ageMax = 0; static volatile uint64_t mesq_ageSum = 0;
+static volatile int64_t  mesq_lastSampleUs = 0;
+// instrumentation self-cost (Rule 2)
+static volatile uint64_t mesq_instrCostUs = 0;
+
+static inline void mesq_bucketSend(uint32_t ms) {
+  uint8_t b = (ms < 20) ? 0 : (ms < 30) ? 1 : (ms < 40) ? 2
+            : (ms < 50) ? 3 : (ms < 60) ? 4 : 5;
+  mesq_sendBuckets[b]++;
+}
+#endif
 
 //#include "soc/rtc_wdt.h"
 ICM_20948_I2C myICM;  // Otherwise create an ICM_20948_I2C object
@@ -377,6 +445,7 @@ void setupIMU() {
   if (success) {
     Serial.println(F("DMP enabled."));
   } else {
+    Serial.println(F("INIT_RESULT   : IMU_OK DMP_FAIL"));   // I8 -> NODE-04
     Serial.println(F("Enable DMP failed!"));
     Serial.println(F("Please check that you have uncommented line 29 (#define ICM_20948_USE_DMP) in ICM_20948_C.h..."));
     while (1)
@@ -386,6 +455,7 @@ void setupIMU() {
 
 
   Serial.println(F("IMU enabled"));
+  Serial.println(F("INIT_RESULT   : IMU_OK DMP_OK"));   // I8 -> NODE-04
   calibrated = true;
 }
 
@@ -456,6 +526,36 @@ motorPulse(2);
   // pinMode(3, OUTPUT);
   Serial.begin(115200);
   delay(500);
+
+  // ===== Phase 2 W0: provenance banner (resolves U2) =====
+  // Printed once at boot on every pod. configTICK_RATE_HZ decides whether
+  // vTaskDelay(1) is 1 ms or 10 ms, which decides whether the real transmit
+  // rate is ~32 Hz or ~25 Hz (NODE-03). Three Phase 1 reports depend on it.
+  Serial.println();
+  Serial.println(F("===== MESQUITE POD BOOT ====="));
+  Serial.printf("FW_BUILD      : %s %s\n", __DATE__, __TIME__);
+  Serial.printf("POD_ID        : %d\n", sendID);
+#ifdef ESP_ARDUINO_VERSION_STR
+  Serial.printf("ARDUINO_CORE  : %s\n", ESP_ARDUINO_VERSION_STR);
+#else
+  Serial.println(F("ARDUINO_CORE  : <2.0.0 (macro absent)"));
+#endif
+  Serial.printf("IDF_VERSION   : %s\n", esp_get_idf_version());
+  Serial.printf("TICK_RATE_HZ  : %d\n", (int)configTICK_RATE_HZ);
+  Serial.printf("TICK_PERIOD_MS: %d\n", (int)portTICK_PERIOD_MS);
+  Serial.printf("RESET_REASON  : %d\n", (int)esp_reset_reason());
+  Serial.printf("CPU_FREQ_MHZ  : %d\n", (int)getCpuFrequencyMhz());
+  Serial.printf("HEAP_FREE     : %u\n", (unsigned)ESP.getFreeHeap());
+  Serial.printf("PSRAM_FREE    : %u\n", (unsigned)ESP.getFreePsram());
+  Serial.printf("NOMINAL_FPS   : %d  (gate = 1000/%d = %d ms)\n", fps, fps, 1000/fps);
+#if MESQ_INSTR
+  mesq_bootCount++;                                  // I8
+  Serial.printf("BOOT_COUNT    : %u  (RTC, survives reset)\n", mesq_bootCount);
+  Serial.println(F("INSTR         : ENABLED (MESQ_INSTR=1)"));
+#else
+  Serial.println(F("INSTR         : disabled"));
+#endif
+  Serial.println(F("============================="));
 
   lastOn = millis();
   lastTouch = millis();
@@ -646,10 +746,70 @@ void TaskWifi(void *pvParameters) {
       myData.count = (uint16_t)count;
       myData.ms_lo = (uint16_t)millis();
 
+#if MESQ_INSTR
+      {
+        int64_t _ic0 = esp_timer_get_time();
+        // N1: torn cross-core read shows up as a non-unit quaternion
+        float _n = quat.x*quat.x + quat.y*quat.y + quat.z*quat.z + quat.w*quat.w;
+        if (_n < 0.999f || _n > 1.001f) mesq_normBad++;
+        // N3: age of the sample at the moment we transmit it
+        if (mesq_lastSampleUs != 0) {
+          uint32_t _age = (uint32_t)((_ic0 - mesq_lastSampleUs) / 1000);
+          mesq_ageN++; mesq_ageSum += _age;
+          if (_age > mesq_ageMax) mesq_ageMax = _age;
+        }
+        // I4: actual interval between sends
+        static uint32_t _lastSend = 0;
+        uint32_t _nowMs = millis();
+        if (_lastSend) {
+          uint32_t _iv = _nowMs - _lastSend;
+          mesq_sendN++; mesq_bucketSend(_iv);
+          if (_iv < mesq_sendMin) mesq_sendMin = _iv;
+          if (_iv > mesq_sendMax) mesq_sendMax = _iv;
+        }
+        _lastSend = _nowMs;
+        mesq_instrCostUs += (uint64_t)(esp_timer_get_time() - _ic0);
+      }
+#endif
+
       esp_now_send(broadcastAddress, (uint8_t *)&myData, sizeof(myData));
 
       prev_ms = millis();
       count++;
+
+#if MESQ_INSTR
+      // ---- 1 Hz instrumentation report, on core 0 (TaskWifi) so the
+      // ---- sample task on core 1 is not disturbed. Pod Serial is its own
+      // ---- USB port and is not the dongle's binary stream.
+      {
+        static uint32_t _lastRep = 0;
+        uint32_t _n2 = millis();
+        if (_n2 - _lastRep >= 1000) {
+          _lastRep = _n2;
+          Serial.printf(
+            "[INSTR] id=%d quat6/s=%u read_us(min/mean/max)=%u/%u/%u fifoMore=%u "
+            "send(n=%u min=%u max=%u b=%u/%u/%u/%u/%u/%u) age_ms(mean/max)=%u/%u "
+            "normBad=%u radNeg=%u heap=%u boots=%u instr_us/s=%llu\n",
+            sendID, mesq_quat6N,
+            mesq_readN ? mesq_readMin : 0,
+            mesq_readN ? (uint32_t)(mesq_readSum / mesq_readN) : 0,
+            mesq_readMax, mesq_fifoMoreN,
+            mesq_sendN, mesq_sendN ? mesq_sendMin : 0, mesq_sendMax,
+            mesq_sendBuckets[0], mesq_sendBuckets[1], mesq_sendBuckets[2],
+            mesq_sendBuckets[3], mesq_sendBuckets[4], mesq_sendBuckets[5],
+            mesq_ageN ? (uint32_t)(mesq_ageSum / mesq_ageN) : 0, mesq_ageMax,
+            mesq_normBad, mesq_radNeg,
+            (unsigned)ESP.getFreeHeap(), mesq_bootCount,
+            (unsigned long long)mesq_instrCostUs);
+          mesq_quat6N = 0; mesq_readN = 0; mesq_readSum = 0;
+          mesq_readMin = 0xFFFFFFFF; mesq_readMax = 0; mesq_fifoMoreN = 0;
+          mesq_sendN = 0; mesq_sendMin = 0xFFFFFFFF; mesq_sendMax = 0;
+          for (int _b = 0; _b < 6; _b++) mesq_sendBuckets[_b] = 0;
+          mesq_ageN = 0; mesq_ageSum = 0; mesq_ageMax = 0;
+          mesq_instrCostUs = 0;
+        }
+      }
+#endif
     }
     //vTaskDelay(1/portTICK_PERIOD_MS);  // one tick delay (15ms) in between reads for stability
     vTaskDelay(1);
@@ -712,7 +872,19 @@ void TaskReadIMU(void *pvParameters) {
 
 
     icm_20948_DMP_data_t data;
+#if MESQ_INSTR
+    int64_t _t0 = esp_timer_get_time();
+#endif
     myICM.readDMPdataFromFIFO(&data);
+#if MESQ_INSTR
+    {
+      uint32_t _d = (uint32_t)(esp_timer_get_time() - _t0);
+      mesq_readN++; mesq_readSum += _d;
+      if (_d < mesq_readMin) mesq_readMin = _d;
+      if (_d > mesq_readMax) mesq_readMax = _d;
+      if (myICM.status == ICM_20948_Stat_FIFOMoreDataAvail) mesq_fifoMoreN++;
+    }
+#endif
 
     if ((myICM.status == ICM_20948_Stat_Ok) || (myICM.status == ICM_20948_Stat_FIFOMoreDataAvail))  // Was valid data available?
     {
@@ -724,6 +896,9 @@ void TaskReadIMU(void *pvParameters) {
 
       if ((data.header & DMP_header_bitmap_Quat6) > 0)  // We have asked for GRV data so we should receive Quat6
       {
+#if MESQ_INSTR
+        mesq_quat6N++;   // I9: this count per second IS the DMP output rate
+#endif
         // Q0 value is computed from this equation: Q0^2 + Q1^2 + Q2^2 + Q3^2 = 1.
         // In case of drift, the sum will not add to 1, therefore, quaternion data need to be corrected with right bias values.
         // The quaternion data is scaled by 2^30.
@@ -739,7 +914,11 @@ void TaskReadIMU(void *pvParameters) {
         // Convert the quaternions to Euler angles (roll, pitch, yaw)
         // https://en.wikipedia.org/w/index.php?title=Conversion_between_quaternions_and_Euler_angles&section=8#Source_code_2
 
-        double q0 = sqrt(1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3)));
+        double _rad = 1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3));
+#if MESQ_INSTR
+        if (_rad < 0.0) mesq_radNeg++;   // N2 -> SENS-03
+#endif
+        double q0 = sqrt(_rad);
 
         double q2sqr = q2 * q2;
 
@@ -774,6 +953,9 @@ void TaskReadIMU(void *pvParameters) {
         quat.x = q1;
         quat.y = q2;
         quat.z = q3;
+#if MESQ_INSTR
+        mesq_lastSampleUs = esp_timer_get_time();   // N3: when the sample was produced
+#endif
       }
     }
 

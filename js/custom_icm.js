@@ -919,6 +919,15 @@ function handleWSMessage(obj) {
  
   // Position data - only use Hips px,py,pz for positioning
   // But use HipsAlt's posswap config when HipsAlt is active (within last 1 second)
+  // W1b (PHN-01): the guard below is a TRUTHINESS test, so a coordinate of
+  // exactly 0 -- which is where a WebXR session's origin sits -- silently
+  // drops the frame. Counting it here BEFORE changing behaviour, per Rule 1.
+  if (bone == "Hips" && typeof window._MI !== 'undefined') {
+    var _finite = function (v) { return typeof v === 'number' && isFinite(v); };
+    var _wouldAccept = !!(obj.px && obj.py && obj.pz);
+    var _isValid = _finite(obj.px) && _finite(obj.py) && _finite(obj.pz);
+    if (_isValid) window._MI.onPositionGuard(_wouldAccept);
+  }
   if( bone == "Hips" && obj.px && obj.py && obj.pz ) {
     obj.sensorPosition = { x: obj.px, y: obj.py, z: obj.pz};
     

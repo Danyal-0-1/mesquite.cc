@@ -154,11 +154,38 @@ function generateBVH(jointInfo, motionData) {
 
     // Add the MOTION section with the appropriate number of frames and frame time
     numFramesrecorded = motionData.length;
-    frameTime = 1/30;
+    // ===== I12 (SYNC-07 / WEB-03 / EST-05 / INT-04) =====
+    // Phase 1 measured that hardcoding 1/30 over data actually sampled at
+    // ~32 Hz imposes a ~7% PROGRESSIVE time dilation on every capture, which
+    // is why cross-correlation against ground truth cannot lock (the existing
+    // benchmark reports latencies of -300 ms and -2200 ms for two recordings
+    // of the same activity, at correlations of only ~0.6).
+    //
+    // Use the MEASURED mean frame interval when the recorder supplied one.
+    // window.mesqFrameTiming is populated by the recording path; if it is
+    // absent we fall back to 1/30 AND say so in the file, so a reader can
+    // tell an asserted frame time from a measured one.
+    var frameTime;
+    var _ft = (typeof window !== 'undefined') && window.mesqFrameTiming;
+    var _ftMeasured = false;
+    if (_ft && _ft.frames > 1 && _ft.startMs && _ft.endMs && _ft.endMs > _ft.startMs) {
+        frameTime = ((_ft.endMs - _ft.startMs) / 1000) / (_ft.frames - 1);
+        _ftMeasured = true;
+    } else {
+        frameTime = 1/30;
+    }
     console.log(numFramesrecorded);
     bvhContent += "MOTION\n";
     bvhContent += `Frames: ${numFramesrecorded}\n`;
     bvhContent += `Frame Time: ${frameTime}\n`;
+    // Provenance comment lines. BVH readers ignore unknown trailing header
+    // text, and this is the only wall-clock anchor a capture has ever had
+    // (§13: makes the tester's field log joinable to the second).
+    if (_ft && _ft.startISO) {
+        bvhContent += `; MESQ_CAPTURE_START ${_ft.startISO}\n`;
+        bvhContent += `; MESQ_CAPTURE_END   ${_ft.endISO || ''}\n`;
+    }
+    bvhContent += `; MESQ_FRAME_TIME_SOURCE ${_ftMeasured ? 'measured' : 'ASSUMED_1_30_UNTRUSTWORTHY'}\n`;
 
     motionData.forEach(frame => {
         frame.forEach(joint => {

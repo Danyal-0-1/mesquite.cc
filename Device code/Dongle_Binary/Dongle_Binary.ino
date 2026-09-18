@@ -27,6 +27,7 @@
 
 #include "Arduino.h"
 #include <esp_now.h>
+#include <esp_system.h>   // Phase 2 W0: esp_reset_reason(), esp_get_idf_version()
 #include <esp_wifi.h>     // for esp_wifi_set_channel / set_ps / set_max_tx_power
 #include "WiFi.h"
 #include "ESPAsyncWebServer.h"
@@ -59,6 +60,61 @@
 
 #define NUM_PODS       17
 #define POD_TIMEOUT_MS 5000
+
+// =========================================================================
+//  PHASE 2 INSTRUMENTATION (W1) -- observational only.
+//  Build with -DMESQ_INSTR=1. Default 0 compiles to nothing.
+//
+//  ROUTING DECISION (required by §4.4, see 02_hub_instrumentation/REPORT.md):
+//  Status output uses a DISTINCT FRAMED MESSAGE TYPE on the same USB stream,
+//  not raw text and not the WebSocket.
+//    - raw text  -> rejected: HUB-02, and the browser's JSON branch would
+//                   swallow following binary packets (measured: WEB-02)
+//    - WebSocket -> rejected: that is the phone's path and shares the
+//                   corruption problem this is meant to measure
+//    - 2nd UART  -> rejected: needs a second cable to every deployment
+//  Frame:  [0xAA][0x55][0xFE][len][payload...]   id 0xFE is outside the
+//  valid bone range 0..16 and outside the 0xFF control marker, so the
+//  existing browser parser skips it harmlessly on old builds.
+//
+//  I1  per-id rx counts + drop reasons -> HUB-05 (the key measurement)
+//  I2  RSSI per id                     -> NET-05, C7 body absorption
+//  I3  Serial.write duration           -> does it block in the callback?
+//  I7  softAP station count            -> HUB-01, NET-06
+//  I11 free heap + ws.count()          -> HUB-04
+//  H1  sendReset() invocations         -> HUB-03
+//  H2  esp_now_add_peer failures       -> HUB-07
+//  H3  batt byte decoded from packet   -> per-node battery for free (§4.4)
+// =========================================================================
+#ifndef MESQ_INSTR
+#define MESQ_INSTR 0
+#endif
+
+#if MESQ_INSTR
+#include <esp_timer.h>
+#define MESQ_STATUS_MARKER 0xFE
+
+static volatile uint32_t mesq_rx[NUM_PODS]      = {0};
+static volatile int32_t  mesq_rssiSum[NUM_PODS] = {0};
+static volatile int8_t   mesq_rssiMin[NUM_PODS];
+static volatile int8_t   mesq_rssiMax[NUM_PODS];
+static volatile uint8_t  mesq_batt[NUM_PODS]    = {0};   // H3
+static volatile uint32_t mesq_dropLen = 0, mesq_dropSync = 0, mesq_dropId = 0;
+static volatile uint32_t mesq_wrN = 0, mesq_wrMax = 0; static volatile uint64_t mesq_wrSum = 0;
+static volatile uint32_t mesq_resetCalls = 0;            // H1
+static volatile uint32_t mesq_peerFail = 0;              // H2
+
+// Emit one framed status line. Called ONLY from podTimeoutTask (1 Hz), never
+// from OnDataRecv -- adding writes to the receive callback to measure whether
+// that callback blocks would be circular (§4.4).
+static void mesq_emitStatus(const char *payload) {
+    size_t n = strlen(payload);
+    if (n > 250) n = 250;
+    uint8_t hdr[4] = { SYNC0, SYNC1, MESQ_STATUS_MARKER, (uint8_t)n };
+    Serial.write(hdr, 4);
+    Serial.write((const uint8_t *)payload, n);
+}
+#endif
 
 // Binary wire format (must match pod_watch.ino's pod_packet_t and
 // webserialnative.js's BONE_NAMES table).
@@ -158,6 +214,48 @@ void podTimeoutTask(void *pvParameters) {
                 portEXIT_CRITICAL(&stateMux);
             }
         }
+#if MESQ_INSTR
+        // ---- 1 Hz framed status. Emitted here, NOT from OnDataRecv. ----
+        {
+            char buf[256];
+            int  off = 0;
+            off += snprintf(buf + off, sizeof(buf) - off, "I1 rx=");
+            for (int i = 0; i < NUM_PODS && off < 200; i++) {
+                off += snprintf(buf + off, sizeof(buf) - off, "%u,", mesq_rx[i]);
+            }
+            off += snprintf(buf + off, sizeof(buf) - off,
+                            " drop=%u/%u/%u wr_us(mean/max)=%u/%u sta=%d heap=%u "
+                            "ws=%u rst=%u peerFail=%u",
+                            mesq_dropLen, mesq_dropSync, mesq_dropId,
+                            mesq_wrN ? (uint32_t)(mesq_wrSum / mesq_wrN) : 0,
+                            mesq_wrMax,
+                            (int)WiFi.softAPgetStationNum(),      // I7
+                            (unsigned)ESP.getFreeHeap(),          // I11
+                            (unsigned)ws.count(),                 // I11 / HUB-04
+                            mesq_resetCalls, mesq_peerFail);
+            mesq_emitStatus(buf);
+
+            // second line: RSSI + battery per id (I2, H3)
+            off = 0;
+            off += snprintf(buf + off, sizeof(buf) - off, "I2 rssi=");
+            for (int i = 0; i < NUM_PODS && off < 150; i++) {
+                int32_t mean = mesq_rx[i] ? (mesq_rssiSum[i] / (int32_t)mesq_rx[i]) : 0;
+                off += snprintf(buf + off, sizeof(buf) - off, "%d,", (int)mean);
+            }
+            off += snprintf(buf + off, sizeof(buf) - off, " batt=");
+            for (int i = 0; i < NUM_PODS && off < 240; i++) {
+                off += snprintf(buf + off, sizeof(buf) - off, "%u,", mesq_batt[i]);
+            }
+            mesq_emitStatus(buf);
+
+            for (int i = 0; i < NUM_PODS; i++) {
+                mesq_rx[i] = 0; mesq_rssiSum[i] = 0;
+                mesq_rssiMin[i] = 127; mesq_rssiMax[i] = -128;
+            }
+            mesq_dropLen = mesq_dropSync = mesq_dropId = 0;
+            mesq_wrN = 0; mesq_wrSum = 0; mesq_wrMax = 0;
+        }
+#endif
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -186,19 +284,45 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
     if (len != POD_PACKET_LEN
         || incomingData[0] != SYNC0
         || incomingData[1] != SYNC1) {
+#if MESQ_INSTR
+        if (len != POD_PACKET_LEN) mesq_dropLen++; else mesq_dropSync++;
+#endif
         return;
     }
 
     uint8_t id = incomingData[2];
     if (id >= NUM_PODS) {
         // Unknown bone id (or 0xFF control marker echoed back) -- drop.
+#if MESQ_INSTR
+        mesq_dropId++;
+#endif
         return;
     }
+
+#if MESQ_INSTR
+    // I1 per-id count, I2 RSSI, H3 battery -- all cheap, no allocation.
+    mesq_rx[id]++;
+    mesq_batt[id] = incomingData[3];
+  #if ESP_IDF_VERSION_MAJOR >= 5
+    int8_t _rssi = (int8_t)recv_info->rx_ctrl->rssi;
+    mesq_rssiSum[id] += _rssi;
+    if (_rssi < mesq_rssiMin[id]) mesq_rssiMin[id] = _rssi;
+    if (_rssi > mesq_rssiMax[id]) mesq_rssiMax[id] = _rssi;
+  #endif
+    int64_t _w0 = esp_timer_get_time();
+#endif
 
     // Forward the raw 16 bytes to the host. The browser reassembles via the
     // sync header and unpacks into the same {bone,x,y,z,w,batt,count,millis}
     // shape the JSON path used to produce.
     Serial.write(incomingData, POD_PACKET_LEN);
+#if MESQ_INSTR
+    {   // I3: does Serial.write block inside the ESP-NOW receive callback?
+        uint32_t _d = (uint32_t)(esp_timer_get_time() - _w0);
+        mesq_wrN++; mesq_wrSum += _d;
+        if (_d > mesq_wrMax) mesq_wrMax = _d;   // the MAX is what matters
+    }
+#endif
 
     // Track liveness for the local connection map.
     portENTER_CRITICAL(&stateMux);
@@ -216,7 +340,11 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
         memcpy(peerMacs[id].peer_addr, mac_addr, 6);
         peerMacs[id].channel = ESPNOW_WIFI_CHANNEL;
         peerMacs[id].encrypt = false;
+#if MESQ_INSTR
+        if (esp_now_add_peer(&peerMacs[id]) != ESP_OK) mesq_peerFail++;   // H2
+#else
         esp_now_add_peer(&peerMacs[id]);
+#endif
     }
 }
 
@@ -275,6 +403,30 @@ void espNowTask(void *pvParameters) {
 
 void setup() {
     Serial.begin(921600);
+
+    // ===== Phase 2 W0: provenance banner (resolves U2 for the hub) =====
+    // NOTE: this prints TEXT on the same stream that later carries binary
+    // pod frames. It is safe only because it runs once, before ESP-NOW is
+    // initialised, so no binary frame can interleave with it (HUB-02).
+    // Do NOT add further prints after esp_now_init() without reading
+    // system_assessment_2/02_hub_instrumentation/REPORT.md first.
+    delay(200);
+    Serial.println();
+    Serial.println("===== MESQUITE DONGLE BOOT =====");
+    Serial.printf("FW_BUILD      : %s %s\n", __DATE__, __TIME__);
+#ifdef ESP_ARDUINO_VERSION_STR
+    Serial.printf("ARDUINO_CORE  : %s\n", ESP_ARDUINO_VERSION_STR);
+#else
+    Serial.println("ARDUINO_CORE  : <2.0.0 (macro absent)");
+#endif
+    Serial.printf("IDF_VERSION   : %s\n", esp_get_idf_version());
+    Serial.printf("TICK_RATE_HZ  : %d\n", (int)configTICK_RATE_HZ);
+    Serial.printf("RESET_REASON  : %d\n", (int)esp_reset_reason());
+    Serial.printf("NUM_PODS      : %d\n", NUM_PODS);
+    Serial.printf("ESPNOW_CHANNEL: %d\n", ESPNOW_WIFI_CHANNEL);
+    Serial.printf("PKT_LEN       : %d\n", POD_PACKET_LEN);
+    Serial.printf("HEAP_FREE     : %u\n", (unsigned)ESP.getFreeHeap());
+    Serial.println("================================");
 
     // WiFi mode must come before macAddress()
     WiFi.mode(WIFI_AP_STA);
@@ -346,6 +498,9 @@ void loop() {
 // Binary control packet -- pod_watch.ino's OnDataRecv decodes it as:
 //   [0xAA][0x55][0xFF][cmd]   cmd 0x01 = reboot.
 void sendReset() {
+#if MESQ_INSTR
+    mesq_resetCalls++;   // H1 -> HUB-03: does a stray byte really reboot the fleet?
+#endif
     uint8_t reboot_pkt[4] = { SYNC0, SYNC1, 0xFF, 0x01 };
     for (int i = 0; i < NUM_PODS; i++) {
         if (peerMacsInit[i]) {

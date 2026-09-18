@@ -28,6 +28,21 @@ const POD_PACKET_LEN = 16;
 const SYNC0 = 0xAA;
 const SYNC1 = 0x55;
 
+// Phase 2: framed status from the dongle. [0xAA][0x55][0xFE][len][payload]
+// Marker 0xFE sits outside the valid bone range 0..16 and outside the 0xFF
+// control marker, so it cannot collide with pod data. MUST be handled
+// explicitly -- without this branch the 16-byte reader would consume a
+// status frame as if it were a pod packet and mis-frame everything after it.
+const STATUS_MARKER = 0xFE;
+window._hubStatus = [];          // last 120 framed status lines from the hub
+
+// Instrumentation hooks degrade to no-ops if js/mesq_instr.js is not loaded.
+const _MI = (typeof MesqInstr !== 'undefined') ? MesqInstr : {
+  onPacket(){}, onBytes(){}, onBinaryFrame(){}, onJsonLine(){},
+  onJsonLineLen(){}, onPositionGuard(){}, onNanFrame(){}
+};
+window._MI = _MI;
+
 // MUST match the bone-id table in pod_watch.ino and Dongle.ino.
 const BONE_NAMES = [
   "Head",          //  0
@@ -199,6 +214,7 @@ function _appendBytes(chunk) {
 
 function feedSerialBytes(chunk) {
   window._rxBytes += chunk.length;
+  _MI.onBytes(chunk.length);                       // I6
   _recordTail(chunk);
   _appendBytes(chunk);
   let i = 0;
@@ -212,10 +228,23 @@ function feedSerialBytes(chunk) {
         i += 1;
         continue;
       }
+      // -- Branch A2: framed hub status (Phase 2 instrumentation) --
+      if (_rxBuf.length - i >= 4 && _rxBuf[i + 2] === STATUS_MARKER) {
+        const slen = _rxBuf[i + 3];
+        if (_rxBuf.length - i < 4 + slen) break;   // wait for the whole line
+        let txt = "";
+        for (let k = 0; k < slen; k++) txt += String.fromCharCode(_rxBuf[i + 4 + k]);
+        window._hubStatus.push({ t: Date.now(), line: txt });
+        if (window._hubStatus.length > 120) window._hubStatus.shift();
+        i += 4 + slen;
+        continue;
+      }
       if (_rxBuf.length - i < POD_PACKET_LEN) break;  // need full frame
       const obj = unpackPodPacket(_rxBuf.subarray(i, i + POD_PACKET_LEN));
       if (obj) {
         window._rxMode.binary++;
+        _MI.onBinaryFrame();                       // I6
+        _MI.onPacket(obj.bone, obj.count);         // I5: sequence-gap detection
         try {
           handleWSMessage(obj);
         } catch (e) {
@@ -236,6 +265,7 @@ function feedSerialBytes(chunk) {
     // -- Branch B: legacy JSON line (phone Hips path) --
     if (b === 0x7B /* '{' */ || _jsonLine.length > 0) {
       _jsonLine += String.fromCharCode(b);
+      _MI.onJsonLineLen(_jsonLine.length);         // I6: WEB-02 smoking gun
       if (b === 0x0A /* '\n' */) {
         window._rxLines = (window._rxLines || 0) + 1;
         // Two-stage parse: try the line as-is; if it fails, run it through
@@ -275,8 +305,10 @@ function feedSerialBytes(chunk) {
           };
           if (_isBadNum(j.x) || _isBadNum(j.y) || _isBadNum(j.z) || _isBadNum(j.w)) {
             window._nanFrameDropped = (window._nanFrameDropped || 0) + 1;
+            _MI.onNanFrame();                      // I6
           } else {
             window._rxMode.json++;
+            _MI.onJsonLine();                      // I6
             if (j.bone) {
               window._podRx[j.bone] = (window._podRx[j.bone] || 0) + 1;
             }

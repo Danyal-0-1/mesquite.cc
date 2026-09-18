@@ -338,6 +338,8 @@ var slerpDict = {
   </script>
 
   <script type="module" src="js/threejsscene.js"></script>
+  <!-- Phase 2 instrumentation: must load BEFORE webserialnative.js -->
+  <script src="js/mesq_instr.js"></script>
   <script type="module" src="js/webserialnative.js"></script>
 
   <script>
